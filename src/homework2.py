@@ -2,10 +2,11 @@ import time
 
 import torch
 import torchvision.transforms as transforms
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 
 import environment
-
 
 class Hw2Env(environment.BaseEnv):
     def __init__(self, n_actions=8, **kwargs) -> None:
@@ -15,7 +16,7 @@ class Hw2Env(environment.BaseEnv):
         self._delta = 0.05
 
         theta = np.linspace(0, 2*np.pi, n_actions)
-        actions = np.stack([np.cos(theta), np.sin(theta)], axis=1)
+        actions = np.stack([np.cos(theta), np.sin(theta)], axis=1) # actions variable is a list of unit vectors in 2D
         self._actions = {i: action for i, action in enumerate(actions)}
 
         self._goal_thresh = 0.01
@@ -63,7 +64,7 @@ class Hw2Env(environment.BaseEnv):
         goal_pos = state[4:6]
         ee_to_obj = max(100*np.linalg.norm(ee_pos - obj_pos), 1)
         obj_to_goal = max(100*np.linalg.norm(obj_pos - goal_pos), 1)
-        return 1/(ee_to_obj) + 1/(obj_to_goal)
+        return 1/ee_to_obj + 1/obj_to_goal
 
     def is_terminal(self):
         obj_pos = self.data.body("obj1").xpos[:2]
@@ -81,7 +82,7 @@ class Hw2Env(environment.BaseEnv):
         self._set_ee_in_cartesian(target_pos, rotation=[-90, 0, 180], n_splits=30, threshold=0.04)
         self._t += 1
 
-        state = self.state()
+        state = self.high_level_state()
         reward = self.reward()
         terminal = self.is_terminal()
         truncated = self.is_truncated()
@@ -89,6 +90,7 @@ class Hw2Env(environment.BaseEnv):
 
 
 if __name__ == "__main__":
+
     N_ACTIONS = 8
     env = Hw2Env(n_actions=N_ACTIONS, render_mode="gui")
     for episode in range(10):

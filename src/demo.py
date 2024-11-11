@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 
-import environment
+from src import environment
 
 
 class Homework2(environment.BaseEnv):

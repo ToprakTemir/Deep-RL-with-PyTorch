@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 import torch.multiprocessing as mp
 import numpy as np
 
-import environment
+from src import environment
 
 
 class Hw3Env(environment.BaseEnv):

@@ -3,7 +3,7 @@ import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
 
-import environment
+from src import environment
 
 
 class CNP(torch.nn.Module):
