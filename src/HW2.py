@@ -184,6 +184,14 @@ class DQNAgent:
         self.q_network.load_state_dict(torch.load(path))
         self.target_network.load_state_dict(torch.load(path))
 
+    def set_epsilon_zero(self):
+        self.epsilon = 0
+
+    def set_epsilon_min(self):
+        self.epsilon = self.epsilon_min
+
+    def set_epsilon(self, epsilon):
+        self.epsilon = epsilon
 
 # Train the agent in the simulation environment
 
@@ -193,12 +201,13 @@ if __name__ == "__main__":
 
     state_dim = 6
     agent = DQNAgent(state_dim)
+    agent.load('model.pth')
 
     # HYPERPARAMETERS: batch_size, update_freq
-    n_episodes = 1000
-    batch_size = 128
+    n_episodes = 2000
+    batch_size = 64
     update_freq = 4
-    reward_list = []
+    reward_list = np.zeros(n_episodes)
     for episode in range(n_episodes):
         env.reset()
         done = False
@@ -221,14 +230,22 @@ if __name__ == "__main__":
         print(f"Episode={episode}, reward={cum_reward}, RF={env.data.time/(end-start):.2f}")
 
         # plot episode-reward graph
-        reward_list.append(cum_reward)
+        reward_list[episode] = cum_reward
 
+    np.save('HW2/reward_list.npy', reward_list)
     plt.plot(reward_list)
     plt.xlabel('Episode')
     plt.ylabel('Reward')
+    plt.savefig('reward_plot.png')
+
+    # plot the smoothed reward
+    smoothed_reward_list = np.convolve(reward_list, np.ones(100)/100, mode='valid')
+    plt.plot(smoothed_reward_list)
+    plt.xlabel('Episode')
+    plt.ylabel('Smoothed Reward')
 
     # save the plot instead of displaying it
-    plt.savefig('reward_plot.png')
+    plt.savefig('smoothed_reward_plot.png')
 
     # save the model
     agent.save('model.pth')
