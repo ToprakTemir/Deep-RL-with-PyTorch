@@ -248,9 +248,11 @@ class PPOAgent:
         self.value_lr = 3e-4 # learning rate
         self.n_steps = 2048 # number of steps to collect per worker before updating the model
         self.gamma = 0.99  # discount factor
+        self.gae_lambda = 0.95  # for GAE (Generalized Advantage Estimation)
         self.epsilon = 0.2  # clip ratio
         self.initial_beta = 0.03 # entropy coefficient for the policy loss
         self.polyak_tau = 0.002 # for updating the target value network
+        self.max_grad_norm = 0.5 # max value for the gradient clipping
         self.num_updates = 10  # number of updates given one big batch
         self.batch_size = 1024 # number of samples in one big batch
         self.mini_batch_size = 64 # number of samples in one mini-batch
@@ -260,7 +262,7 @@ class PPOAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy_network = policy_network
         self.value_network = value_network
-        self.value_target_network = value_network.copy() # TODO here
+        self.value_target_network = value_network.copy()
         self.policy_optimizer = optim.Adam(self.policy_network.parameters(), lr=self.policy_lr)
         self.value_optimizer = optim.Adam(self.value_network.parameters(), lr=self.value_lr)
         self.replay_buffer = Memory(keys=["state", "action", "reward", "next_state", "done"], buffer_length=self.buffer_length)
@@ -301,7 +303,7 @@ class PPOAgent:
             dones = samples["done"][indices].to(self.device)
 
             # compute advantage
-            # TODO: implement GAE (Generalized Advantage Estimation) or another advanced method for computing advantage
+            # TODO: implement GAE (Generalized Advantage Estimation) for computing advantage
             with torch.no_grad():
                 values = self.value_network(states).squeeze()
                 next_values = self.value_network(next_states).squeeze()
@@ -336,10 +338,11 @@ class PPOAgent:
             # update policy network
             self.policy_optimizer.zero_grad()
             policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), self.max_grad_norm)
             self.policy_optimizer.step()
 
             # compute value loss
-            # TODO: maybe implement value clipping
+            # TODO: bootstrapped returns should be computed by advantages acquired by GAE
             values = self.value_network(states).squeeze()
             next_values = self.value_target_network(next_states).squeeze()
             bootstrapped_returns = rewards + (1 - dones.float()) * self.gamma * next_values
@@ -351,6 +354,7 @@ class PPOAgent:
             # update value network
             self.value_optimizer.zero_grad()
             value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value_network.parameters(), self.max_grad_norm)
             self.value_optimizer.step()
 
             # update the target network
