@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from datetime import datetime
 
 import torch
 import torchvision.transforms as transforms
@@ -9,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.nn.functional import softplus
 
-from src import environment
+import environment
 
 
 class Hw3Env(environment.BaseEnv):
@@ -19,7 +20,7 @@ class Hw3Env(environment.BaseEnv):
         self._delta = 0.05
 
         self._goal_thresh = 0.01
-        self._max_timesteps = 50
+        self._max_timesteps = 2048 # !! MANUAL HYPERPARAMETER FOR ROLLOUT BUFFER
 
     def _create_scene(self, seed=None):
         if seed is not None:
@@ -48,7 +49,7 @@ class Hw3Env(environment.BaseEnv):
             pixels = torch.tensor(pixels, dtype=torch.float32).permute(2, 0, 1)
             pixels = transforms.functional.center_crop(pixels, min(pixels.shape[1:]))
             pixels = transforms.functional.resize(pixels, (128, 128))
-        return pixels.float() / 255.0
+        return pixels.float()
 
     def high_level_state(self):
         ee_pos = self.data.site(self._ee_site).xpos[:2]
@@ -146,8 +147,8 @@ class PolicyNetwork(torch.nn.Module):
         x = self.conv(x)
         x = x.mean(dim=[2, 3])
         x = self.linear(x)
-        std_x1 = softplus(x[:, 1].clone()) + 1e-5
-        std_x3 = softplus(x[:, 3].clone()) + 1e-5
+        std_x1 = softplus(x[:, 1].clone()) + 1e-4
+        std_x3 = softplus(x[:, 3].clone()) + 1e-4
         x = torch.cat([x[:, 0].unsqueeze(1), std_x1.unsqueeze(1), x[:, 2].unsqueeze(1), std_x3.unsqueeze(1)], dim=1)
         return x
 
@@ -190,6 +191,7 @@ class ValueNetwork(torch.nn.Module):
 
 def collector(model, shared_queue, is_collecting, is_finished, device, shared_reward_list):
     env = Hw3Env(render_mode="offscreen")
+
     while not is_finished.is_set():
         while is_collecting.is_set():
             env.reset()
@@ -200,47 +202,74 @@ def collector(model, shared_queue, is_collecting, is_finished, device, shared_re
                 with torch.no_grad():
                     action = model(state.to(device))
 
-                action = action[0] # convert (1, 4) to (4)
-                # sample x ~ N(action[0], action[1])
-                x = torch.normal(action[0], action[1])
-                y = torch.normal(action[2], action[3])
-                action = torch.stack([x, y], dim=0)
+                if torch.isnan(action).any():
+                    print("NaN detected in policy network output. Skipping this sample.")
+                    break
 
-                next_state, reward, is_terminal, is_truncated = env.step(action[0])
+                # !! below way ignores the correlations between x and y
+                # x = torch.normal(action[0], action[1])
+                # y = torch.normal(action[2], action[3])
+                # action = torch.stack([x, y], dim=0)
+
+                action = action[0] # convert (1, 4) to (4,)
+                mean = action[[0, 2]]
+                std = action[[1, 3]]
+
+                if torch.isnan(mean).any() or torch.isnan(std).any():
+                    print(f"NaN detected in mean or std: mean={mean}, std={std}. Skipping this sample.")
+                    break
+
+                cov_matrix = torch.diag(std**2)
+                dist = torch.distributions.MultivariateNormal(mean, cov_matrix)
+                action = dist.sample()
+
+                next_state, reward, is_terminal, is_truncated = env.step(action)
                 cum_reward += reward
                 done = is_terminal or is_truncated
-                shared_queue.put(((state*255).float(), action, reward, (next_state*255).float(), done))
+                shared_queue.put((state.float(), action, reward, next_state.float(), done))
                 state = next_state
                 if is_finished.is_set():
                     break
+
             shared_reward_list.append(cum_reward)
-            print(shared_reward_list[-1])
+            print(cum_reward)
 
             if is_finished.is_set():
                 break
-        if is_finished.is_set():
-            break
         is_collecting.wait()
 
+num_epochs = 10000
 
 class PPOAgent:
     def __init__(self, policy_network, value_network) -> None:
 
         # HYPERPARAMETERS
-        self.policy_lr = 1e-4 # learning rate
-        self.value_lr = 1e-4 # learning rate
+        self.policy_lr = 3e-4 # learning rate
+        self.value_lr = 3e-4 # learning rate
+        self.n_steps = 2048 # number of steps to collect per worker before updating the model
         self.gamma = 0.99  # discount factor
         self.epsilon = 0.2  # clip ratio
+        self.initial_beta = 0.03 # entropy coefficient for the policy loss
+        self.polyak_tau = 0.002 # for updating the target value network
         self.num_updates = 10  # number of updates given one big batch
         self.batch_size = 1024 # number of samples in one big batch
         self.mini_batch_size = 64 # number of samples in one mini-batch
         self.buffer_length = 10000 # replay buffer length
 
+        self.current_epoch = 0
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy_network = policy_network
         self.value_network = value_network
+        self.value_target_network = value_network.copy() # TODO here
         self.policy_optimizer = optim.Adam(self.policy_network.parameters(), lr=self.policy_lr)
         self.value_optimizer = optim.Adam(self.value_network.parameters(), lr=self.value_lr)
         self.replay_buffer = Memory(keys=["state", "action", "reward", "next_state", "done"], buffer_length=self.buffer_length)
+
+    def to(self, device):
+        self.device = device
+        self.policy_network.to(device)
+        self.value_network.to(device)
+        return self
 
     def add_to_replay_buffer(self, transition):
         self.replay_buffer.append(transition)
@@ -257,57 +286,82 @@ class PPOAgent:
     # 5) update value
     def train(self):
 
+        self.current_epoch += 1
         samples = self.replay_buffer.sample_n(self.batch_size)
 
-        old_policy = self.policy_network.copy()
-        for _ in range(num_updates):
+        old_policy = self.policy_network.copy().to(self.device)
+        for _ in range(self.num_updates):
 
             # sample mini-batch
             indices = torch.randperm(self.batch_size)[:self.mini_batch_size]
-            states = samples["state"][indices]
-            actions = samples["action"][indices]
-            rewards = samples["reward"][indices]
-            next_states = samples["next_state"][indices]
-            dones = samples["done"][indices]
+            states = samples["state"][indices].to(self.device)
+            actions = samples["action"][indices].to(self.device)
+            rewards = samples["reward"][indices].to(self.device)
+            next_states = samples["next_state"][indices].to(self.device)
+            dones = samples["done"][indices].to(self.device)
 
             # compute advantage
+            # TODO: implement GAE (Generalized Advantage Estimation) or another advanced method for computing advantage
             with torch.no_grad():
-                values = self.value_network(states)
-                next_values = self.value_network(next_states)
-                advantages = rewards + (~dones) * self.gamma * next_values - values # one-step TD error
+                values = self.value_network(states).squeeze()
+                next_values = self.value_network(next_states).squeeze()
+                advantages = rewards + (1 - dones.float()) * self.gamma * next_values - values # one-step TD error
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                advantages = advantages.detach()
 
             # compute policy loss
+
             new_policy_output = self.policy_network(states)
-            old_policy = PolicyNetwork()
-            old_policy.load_state_dict(old_policy.state_dict())
-            old_policy_outputs = old_policy(states)
+            mean = new_policy_output[:, [0, 2]]
+            std = new_policy_output[:, [1, 3]]
+            cov_matrix = torch.diag_embed(std**2)
+            dist = torch.distributions.MultivariateNormal(mean, cov_matrix)
+            print(f"mean={mean.mean()}, std={std.mean()}, entropy={dist.entropy().mean()}")
+            new_log_probs = dist.log_prob(actions) # log prob of action being sampled from the new policy
 
-            new_log_probs = torch.distributions.Normal(new_policy_output[:, 0], new_policy_output[:, 1]).log_prob(actions[:, 0])
-            old_log_probs = torch.distributions.Normal(old_policy_outputs[:, 0], old_policy_outputs[:, 1]).log_prob(actions[:, 0])
-            log_prob_diff = torch.clamp(new_log_probs - old_log_probs, min=-10, max=10)
-            ratio = torch.exp(log_prob_diff)
+            with torch.no_grad():
+                old_policy_outputs = old_policy(states)
+                mean = old_policy_outputs[:, [0, 2]]
+                std = old_policy_outputs[:, [1, 3]]
+                cov_matrix = torch.diag_embed(std**2)
+                dist = torch.distributions.MultivariateNormal(mean, cov_matrix)
+                old_log_probs = dist.log_prob(actions) # log prob of action being sampled from the old policy
+
+            ratio = torch.exp(new_log_probs - old_log_probs)
             clipped_ratio = torch.clamp(ratio, 1-self.epsilon, 1+self.epsilon)
-            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+            policy_entropy = dist.entropy().mean()
+            beta = max(self.initial_beta * (1 - self.current_epoch / num_epochs), 0.002)
+            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean() - beta * policy_entropy
 
-            # update policy
+            # update policy network
             self.policy_optimizer.zero_grad()
-            with torch.autograd.set_detect_anomaly(True):
-                policy_loss.backward()
+            policy_loss.backward()
             self.policy_optimizer.step()
 
             # compute value loss
-            values = self.value_network(states)
-            value_loss = torch.nn.MSELoss()(values, rewards.unsqueeze(1))
+            # TODO: maybe implement value clipping
+            values = self.value_network(states).squeeze()
+            next_values = self.value_target_network(next_states).squeeze()
+            bootstrapped_returns = rewards + (1 - dones.float()) * self.gamma * next_values
+            print(f"values={values.mean()}, next_values={next_values.mean()}, rewards={rewards.mean()} returns={bootstrapped_returns.mean()}")
+            bootstrapped_returns.detach()
+            mse_loss = torch.nn.MSELoss()
+            value_loss = mse_loss(values, bootstrapped_returns)
 
-            # update value
+            # update value network
             self.value_optimizer.zero_grad()
-            with torch.autograd.set_detect_anomaly(True):
-                value_loss.backward()
+            value_loss.backward()
             self.value_optimizer.step()
+
+            # update the target network
+            for target_param, param in zip(self.value_target_network.parameters(), self.value_network.parameters()):
+                target_param.data.copy_(self.polyak_tau * param.data + (1 - self.polyak_tau) * target_param.data)
 
 
 
 if __name__ == "__main__":
+
+    start_time = datetime.now()
 
     # multiprocessing setup
     mp.set_start_method("spawn")
@@ -326,22 +380,34 @@ if __name__ == "__main__":
         p.start()
         procs.append(p)
 
+    now = datetime.now()
+    # print working directory
+    data_file_path = "HW3/rewards_list_" + now.strftime("%Y.%m.%d-%H:%M:%S") + ".pth"
+    data_file = open(data_file_path, "w")
+
     # training agent setup
     training_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     value_network = ValueNetwork().to(training_device)
-    PPOAgent = PPOAgent(policy_network, value_network)
+    PPOAgent = PPOAgent(policy_network, value_network).to(training_device)
 
-    num_updates = 100
-    for i in range(num_updates):
+    for i in range(num_epochs):
         is_collecting.set()
 
         start = time.time()
         buffer_feeded = 0
         while buffer_feeded < 400:
-            print(f"Buffer size={len(PPOAgent.replay_buffer)}", end="\r")
+            # print(f"Buffer size={len(PPOAgent.replay_buffer)}", end="\r")
             if not shared_queue.empty():
                 # unfortunately, you can't feed the replay buffer as fast as you collect
+
+                # save the rewards to a file
+                for item in shared_reward_list:
+                    data_file.write(f"{item}\n")
+                shared_reward_list[:] = [] # ! don't write the same rewards again
+                data_file.flush()
+
                 state, action, reward, next_state, done = shared_queue.get()
+
                 PPOAgent.add_to_replay_buffer({
                     "state": torch.tensor(state.clone(), dtype=torch.float32),
                     "action": torch.tensor(action.clone(), dtype=torch.float32),
@@ -361,11 +427,14 @@ if __name__ == "__main__":
 
         # do your updates here
         PPOAgent.train()
+        torch.save(policy_network.state_dict(), f"HW3/policy_network_{start_time}.pth")
+        torch.save(value_network.state_dict(), f"HW3/value_network_{start_time}.pth")
         print(f"Model updated in {time.time()-end:.2f} seconds")
 
 
-    reward_list = list(shared_reward_list)
-    print(reward_list)
+    reward_data = np.loadtxt(data_file_path)
+    reward_list = reward_data.tolist()
+    data_file.close()
 
     # plot the reward
     plt.plot(reward_list)
@@ -378,8 +447,14 @@ if __name__ == "__main__":
     plt.plot(smoothed_reward)
     plt.xlabel('Episode')
     plt.ylabel('Reward')
+    plt.show()
+
+    # save the models
+    torch.save(policy_network.state_dict(), "HW3/policy_network.pth")
+    torch.save(value_network.state_dict(), "HW3/value_network.pth")
+
 
     is_collecting.clear()
     is_finished.set()
     for p in procs:
-        p.join()
+        p.kill()
