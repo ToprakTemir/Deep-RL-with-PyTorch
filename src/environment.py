@@ -34,7 +34,13 @@ class BaseEnv:
         self._joint_qpos_idxs = [self.model.joint(x).qposadr for x in self._joint_names]
         self._ee_site = "ur5e/robotiq_2f85/gripper_site"
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+        else:
+            np.random.seed()
+
+
         if hasattr(self, "model"):
             del self.model
         if hasattr(self, "data"):
