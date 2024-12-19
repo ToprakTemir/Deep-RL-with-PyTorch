@@ -15,7 +15,8 @@ Project files and implementations for CMPE591 (Deep Learning in Robotics course)
 
 
 
-### Reward Plot Explanations: 
+
+### Reward Plot History Records: 
 added_target_network: 
 
 The first value function couldn't learn at all because I didn't save the observation rewards at sample time, so the same network had to both predict the value and assess its own prediction, which causes the circularity problem encountered in offline RL algorithms like DQN. My thought at the time was to solve it the way it is solved in offline RL, by a target network, which partially solved the problem.
