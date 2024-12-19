@@ -1,7 +1,5 @@
 import time
 from absl.logging import flush
-from jedi.api.strings import complete_dict
-from queue import Queue
 from collections import deque
 from datetime import datetime
 
@@ -10,12 +8,15 @@ import torchvision.transforms as transforms
 import torch.multiprocessing as mp
 import torch.optim as optim
 import numpy as np
-import matplotlib.pyplot as plt
 from torch.nn.functional import softplus
 
 import environment
 
+
+# ENVIRONMENT HYPERPARAMETERS
 timestep_multiplier = 4
+task_complete_reward = 100
+goal_thresh = 0.05
 
 class Hw3Env(environment.BaseEnv):
     def __init__(self, **kwargs) -> None:
@@ -23,7 +24,7 @@ class Hw3Env(environment.BaseEnv):
         # divide the action space into n_actions
         self._delta = 0.05
 
-        self._goal_thresh = 0.01
+        self._goal_thresh = goal_thresh
         self._max_timesteps = 50 * timestep_multiplier
 
     def _create_scene(self, seed=None):
@@ -42,6 +43,11 @@ class Hw3Env(environment.BaseEnv):
         environment.create_visual(scene, "cylinder", pos=goal_pos, quat=[0, 0, 0, 1],
                                   size=[0.05, 0.005], rgba=[0.2, 1.0, 0.2, 1],
                                   name="goal")
+
+        # if the object is too close to the goal, recreate the scene
+        if np.sqrt((obj_pos[0] - goal_pos[0])**2 + (obj_pos[1] - goal_pos[1])**2) < 1.2 * goal_thresh:
+            return self._create_scene(seed)
+
         return scene
 
     def state(self):
@@ -93,6 +99,10 @@ class Hw3Env(environment.BaseEnv):
         reward = self.reward()
         terminal = self.is_terminal()
         truncated = self.is_truncated()
+
+        if terminal:
+            reward += task_complete_reward
+
         return state, reward, terminal, truncated
 
 
@@ -241,10 +251,12 @@ def collector(policy_network, value_network, shared_queue, is_collecting, is_fin
                 log_prob = dist.log_prob(action) # the log probability of the executed action being selected
 
                 next_state, reward, is_terminal, is_truncated = env.step(action)
-                cum_reward += reward
+
                 done = is_terminal or is_truncated
                 if done:
                     last_value = value
+
+                cum_reward += reward
 
                 rollout["states"].append(state)
                 rollout["actions"].append(action)
@@ -258,8 +270,7 @@ def collector(policy_network, value_network, shared_queue, is_collecting, is_fin
                     break
 
             # post-processing the advantages
-            advantages = compute_gae(rollout["rewards"], rollout["values"], rollout["dones"], last_value)
-            rollout["advantages"] = advantages
+            rollout["advantages"] = compute_gae(rollout["rewards"], rollout["values"], rollout["dones"], last_value)
 
             for i in np.random.permutation(len(rollout["states"])):
                 shared_queue.put([rollout["states"][i], rollout["actions"][i], rollout["rewards"][i], rollout["dones"][i], rollout["log_probs"][i], rollout["values"][i], rollout["advantages"][i]])
@@ -326,7 +337,6 @@ class PPOAgent:
         self.num_workers = 6
         self.rollout_buffer = RolloutBuffer(self.n_steps)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy_network = policy_network
         self.value_network = value_network
         self.policy_optimizer = optim.Adam(self.policy_network.parameters(), lr=self.policy_lr)
@@ -404,6 +414,11 @@ if __name__ == "__main__":
     policy_network.share_memory()  # share model parameters across processes
     value_network = ValueNetwork()
     value_network.share_memory()
+
+    # IMPORTANT: TO CONTINUE TRAINING FROM WHERE IT LEFT OFF
+    policy_network.load_state_dict(torch.load("HW3/network-snapshots/policy_network_2024-12-18 18:10:14.391244.pth"))
+    value_network.load_state_dict(torch.load("HW3/network-snapshots/value_network_2024-12-18 18:10:14.391244.pth"))
+
     PPOAgent = PPOAgent(policy_network, value_network).to(device)
 
     shared_queue = mp.Queue()
@@ -417,8 +432,12 @@ if __name__ == "__main__":
         p.start()
         worker_processes.append(p)
 
-    rewards_file_path = f"HW3/rewards/rewards_list_{datetime.now().strftime('%Y.%m.%d-%H:%M:%S')}-x{timestep_multiplier}.pth"
-    rewards_file = open(rewards_file_path, "w")
+    # rewards_file_path = f"HW3/rewards/rewards_list_{datetime.now().strftime('%Y.%m.%d-%H:%M:%S')}-x{timestep_multiplier}.pth"
+    # rewards_file = open(rewards_file_path, "w")
+
+    # IMPORTANT: BELOW IS TO CONTINUE TRAINING FROM WHERE IT LEFT OFF
+    reward_file_path = f"HW3/rewards/rewards_list_2024.12.18-18:10:15-x4.pth"
+    rewards_file = open(reward_file_path, "a")
 
 
     num_updates = 10000
@@ -450,14 +469,11 @@ if __name__ == "__main__":
 
         # training
         PPOAgent.train()
+
+        # saving the one more step trained model
         torch.save(policy_network.state_dict(), f"HW3/network-snapshots/policy_network_{start_time}.pth")
         torch.save(value_network.state_dict(), f"HW3/network-snapshots/value_network_{start_time}.pth")
         print(f"Model updated in {time.time() - end} seconds")
-
-
-    # save the models
-    torch.save(policy_network.state_dict(), "HW3/policy_network.pth")
-    torch.save(value_network.state_dict(), "HW3/value_network.pth")
 
 
     is_collecting.clear()

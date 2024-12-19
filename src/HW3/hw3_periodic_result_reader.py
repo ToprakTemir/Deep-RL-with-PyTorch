@@ -60,6 +60,10 @@ def update_plots(data, line_raw, line_smoothed, ax1, ax2):
     ax2.relim()
     ax2.autoscale_view()
 
+    # draw a vertical line at data point 4280
+    ax1.axvline(x=4280, color='r', linestyle='--')
+    ax2.axvline(x=4280, color='r', linestyle='--')
+
     # Refresh the plots
     plt.draw()
     fig.canvas.flush_events()
@@ -71,6 +75,8 @@ while True:
         data = []
         with open(reward_list_path, "r") as f:
             for ln in f:
+                if ln == "\n":
+                    continue
                 data.append(float(ln.strip()))  # Assuming each line is a single float value
         data = np.array(data)
 
